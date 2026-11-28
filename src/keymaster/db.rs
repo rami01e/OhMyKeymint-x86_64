@@ -135,7 +135,7 @@ impl_metadata!(
         /// SEC1 public key for ECDH encryption
         Sec1PublicKey(Vec<u8>) with accessor sec1_public_key,
         /// Keybox identity prefix used to produce this entry's device attestation chain.
-        KeyboxAttestationUuidPrefix(Vec<u8>) with accessor keybox_attestation_uuid_prefix,
+        KeyboxAttestationDigestPrefix(Vec<u8>) with accessor keybox_attestation_digest_prefix,
         //  --- ADD NEW META DATA FIELDS HERE ---
         // For backwards compatibility add new entries only to
         // end of this list and above this comment.
@@ -303,7 +303,7 @@ impl FromSql for KeyType {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Uuid([u8; 16]);
 
-const KEYBOX_UUID_DIGEST_BYTES: usize = 12;
+pub(crate) const KEYBOX_DIGEST_PREFIX_BYTES: usize = 12;
 
 impl Deref for Uuid {
     type Target = [u8; 16];
@@ -315,37 +315,16 @@ impl Deref for Uuid {
 
 impl From<SecurityLevel> for Uuid {
     fn from(sec_level: SecurityLevel) -> Self {
-        Self::from_keybox_digest(sec_level, crate::keybox::current_identity_digest())
+        Self((sec_level.0 as u128).to_be_bytes())
     }
 }
 
 impl Uuid {
-    pub(crate) fn from_keybox_digest(sec_level: SecurityLevel, digest: [u8; 32]) -> Self {
-        let mut uuid_bytes = [0u8; 16];
-        uuid_bytes[..KEYBOX_UUID_DIGEST_BYTES].copy_from_slice(&digest[..KEYBOX_UUID_DIGEST_BYTES]);
-        uuid_bytes[KEYBOX_UUID_DIGEST_BYTES..].copy_from_slice(&(sec_level.0 as u32).to_be_bytes());
-        Self(uuid_bytes)
-    }
-
     pub fn to_security_level(&self) -> Option<SecurityLevel> {
-        let mut sec_level_bytes = [0u8; 4];
-        sec_level_bytes.copy_from_slice(&self.0[KEYBOX_UUID_DIGEST_BYTES..]);
-        match u32::from_be_bytes(sec_level_bytes) {
-            0 | 1 | 2 | 100 => Some(SecurityLevel(u32::from_be_bytes(sec_level_bytes) as i32)),
+        match u128::from_be_bytes(self.0) {
+            level @ (0 | 1 | 2 | 100) => Some(SecurityLevel(level as i32)),
             _ => None,
         }
-    }
-
-    pub fn get_digest(&self) -> &[u8] {
-        &self.0[..KEYBOX_UUID_DIGEST_BYTES]
-    }
-
-    pub(crate) fn is_bound_to_keybox_digest(&self, digest: [u8; 32]) -> bool {
-        self.get_digest() == &digest[..KEYBOX_UUID_DIGEST_BYTES]
-    }
-
-    pub(crate) fn is_keybox_bound(&self) -> bool {
-        *self != KEYSTORE_UUID && self.to_security_level().is_some()
     }
 }
 
@@ -944,9 +923,14 @@ pub struct SupersededBlob {
 
 impl KeystoreDB {
     const UNASSIGNED_KEY_ID: i64 = -1i64;
-    const CURRENT_DB_VERSION: u32 = 4;
-    const UPGRADERS: &'static [fn(&Transaction) -> Result<u32>] =
-        &[Self::from_0_to_1, Self::from_1_to_2, Self::from_2_to_3, Self::from_3_to_4];
+    const CURRENT_DB_VERSION: u32 = 5;
+    const UPGRADERS: &'static [fn(&Transaction) -> Result<u32>] = &[
+        Self::from_0_to_1,
+        Self::from_1_to_2,
+        Self::from_2_to_3,
+        Self::from_3_to_4,
+        Self::from_4_to_5,
+    ];
 
     /// Name of the file that holds the cross-boot persistent database.
     pub const PERSISTENT_DB_FILENAME: &'static str = "keymaster.db";
@@ -1112,7 +1096,7 @@ impl KeystoreDB {
         db_utils::with_rows_extract_all(&mut rows, |row| {
             let key_id: i64 = row.get(0).context("Failed to read key id.")?;
             let km_uuid: Uuid = row.get(1).context("Failed to read key UUID.")?;
-            if !km_uuid.is_keybox_bound() {
+            if !matches!(km_uuid[12..], [0, 0, 0, 1 | 2]) {
                 return Ok(());
             }
             let leaf_cert = row.get(2).context("Failed to read leaf cert.")?;
@@ -1146,7 +1130,7 @@ impl KeystoreDB {
                 return Ok(());
             }
 
-            candidates.push((key_id, km_uuid.get_digest().to_vec()));
+            candidates.push((key_id, km_uuid[..KEYBOX_DIGEST_PREFIX_BYTES].to_vec()));
             Ok(())
         })
         .context("Failed to extract keybox attestation metadata backfill candidates")?;
@@ -1154,7 +1138,7 @@ impl KeystoreDB {
         for (key_id, prefix) in candidates {
             tx.execute(
                 "INSERT OR IGNORE INTO persistent.keymetadata (keyentryid, tag, data) VALUES (?, ?, ?);",
-                params![key_id, KeyMetaData::KeyboxAttestationUuidPrefix, prefix],
+                params![key_id, KeyMetaData::KeyboxAttestationDigestPrefix, prefix],
             )
             .context("Trying to insert keybox attestation metadata")?;
         }
@@ -1177,6 +1161,41 @@ impl KeystoreDB {
 
         // DB version is now 4.
         Ok(4)
+    }
+
+    fn from_4_to_5(tx: &Transaction) -> Result<u32> {
+        // Preserve proven attestation digests before dropping the legacy UUID prefix.
+        tx.execute(
+            "DELETE FROM persistent.keymetadata AS m
+             WHERE m.tag = ? AND NOT EXISTS (
+                 SELECT 1 FROM persistent.keyentry AS k
+                 WHERE k.id = m.keyentryid AND k.key_type = ?
+                   AND typeof(k.km_uuid) = 'blob' AND length(k.km_uuid) = 16
+                   AND substr(k.km_uuid, 13, 4) IN (X'00000001', X'00000002')
+                   AND m.data = substr(k.km_uuid, 1, 12) AND m.data != zeroblob(12));",
+            params![KeyMetaData::KeyboxAttestationDigestPrefix, KeyType::Client],
+        )
+        .context("Failed to remove invalid legacy keybox attestation metadata")?;
+
+        tx.execute(
+            "UPDATE persistent.keyentry
+             SET km_uuid = CAST(zeroblob(12) || substr(km_uuid, 13, 4) AS BLOB)
+             WHERE typeof(km_uuid) = 'blob' AND length(km_uuid) = 16
+               AND substr(km_uuid, 13, 4) IN (X'00000000', X'00000001', X'00000002', X'00000064')
+               AND substr(km_uuid, 1, 12) != zeroblob(12);",
+            [],
+        )
+        .context("Failed to normalize stored KeyMint UUIDs")?;
+        tx.execute(
+            "UPDATE persistent.blobmetadata
+             SET data = CAST(zeroblob(12) || substr(data, 13, 4) AS BLOB)
+             WHERE tag = ? AND typeof(data) = 'blob' AND length(data) = 16
+               AND substr(data, 13, 4) IN (X'00000000', X'00000001', X'00000002', X'00000064')
+               AND substr(data, 1, 12) != zeroblob(12);",
+            params![BlobMetaData::KmUuid],
+        )
+        .context("Failed to normalize KeyMint UUIDs in blob metadata")?;
+        Ok(5)
     }
 
     fn init_tables(tx: &Transaction) -> Result<()> {
@@ -1303,6 +1322,13 @@ impl KeystoreDB {
         )
         .context("Failed to initialize \"grant\" table.")?;
 
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS persistent.keybox_state (
+                    security_level INTEGER PRIMARY KEY,
+                    identity_digest BLOB NOT NULL);",
+            [],
+        )
+        .context("Failed to initialize keybox state table.")?;
         Ok(())
     }
 
@@ -1608,11 +1634,39 @@ impl KeystoreDB {
 
     pub fn retire_stale_keybox_bound_entries(
         &mut self,
-        current_identity_digest: [u8; 32],
+        tee_identity_digest: Option<[u8; 32]>,
+        strongbox_identity_digest: Option<[u8; 32]>,
+        enabled: bool,
     ) -> Result<usize> {
         let _wp = wd::watch("KeystoreDB::retire_stale_keybox_bound_entries");
 
         self.with_transaction(Immediate("TX_retire_stale_keybox_bound_entries"), |tx| {
+            let rotation = |level: SecurityLevel, digest: Option<[u8; 32]>| -> Result<_> {
+                let Some(digest) = digest else { return Ok(None) };
+                let initialized = tx.execute(
+                    "INSERT OR IGNORE INTO persistent.keybox_state (security_level, identity_digest)
+                     VALUES (?, ?);",
+                    params![level.0, digest],
+                )? != 0;
+                // The first observation establishes the baseline for an upgraded database.
+                if initialized || !enabled {
+                    return Ok(None);
+                }
+                let changed = tx.execute(
+                    "UPDATE persistent.keybox_state SET identity_digest = ?
+                     WHERE security_level = ? AND identity_digest != ?;",
+                    params![digest, level.0, digest],
+                )? != 0;
+                Ok(changed.then_some(digest))
+            };
+            let tee_identity_digest =
+                rotation(SecurityLevel::TRUSTED_ENVIRONMENT, tee_identity_digest)?;
+            let strongbox_identity_digest =
+                rotation(SecurityLevel::STRONGBOX, strongbox_identity_digest)?;
+            if tee_identity_digest.is_none() && strongbox_identity_digest.is_none() {
+                return Ok(0).no_gc();
+            }
+
             let mut stmt = tx
                 .prepare(
                     "SELECT k.id, k.km_uuid, m.data
@@ -1620,16 +1674,17 @@ impl KeystoreDB {
                      JOIN persistent.keymetadata AS m
                        ON m.keyentryid = k.id
                       AND m.tag = ?
-                     WHERE k.key_type = ?
-                       AND k.state != ?;",
+                     WHERE k.key_type = ? AND k.state != ?
+                       AND typeof(m.data) = 'blob' AND length(m.data) = ?;",
                 )
                 .context("Failed to prepare keybox-bound stale key query.")?;
 
             let mut rows = stmt
                 .query(params![
-                    KeyMetaData::KeyboxAttestationUuidPrefix,
+                    KeyMetaData::KeyboxAttestationDigestPrefix,
                     KeyType::Client,
-                    KeyLifeCycle::Unreferenced
+                    KeyLifeCycle::Unreferenced,
+                    KEYBOX_DIGEST_PREFIX_BYTES as i64,
                 ])
                 .context("Failed to query keybox-bound stale keys.")?;
 
@@ -1637,32 +1692,17 @@ impl KeystoreDB {
             db_utils::with_rows_extract_all(&mut rows, |row| {
                 let key_id = row.get(0).context("Failed to read stale key id.")?;
                 let km_uuid: Uuid = row.get(1).context("Failed to read stale key UUID.")?;
-                let prefix: Value = row
-                    .get(2)
-                    .context("Failed to read stale keybox attestation metadata.")?;
-                let retire = match prefix {
-                    Value::Blob(prefix)
-                        if prefix.len() == KEYBOX_UUID_DIGEST_BYTES
-                            && km_uuid.is_keybox_bound()
-                            && prefix.as_slice() == km_uuid.get_digest() =>
-                    {
-                        !km_uuid.is_bound_to_keybox_digest(current_identity_digest)
-                    }
-                    Value::Blob(prefix) => {
-                        log::warn!(
-                            "retiring keybox-bound key with invalid attestation metadata: key_id={key_id:#x} uuid={km_uuid:?} prefix_len={}",
-                            prefix.len(),
-                        );
-                        true
-                    }
-                    _ => {
-                        log::warn!(
-                            "retiring keybox-bound key with invalid attestation metadata type: key_id={key_id:#x} uuid={km_uuid:?}",
-                        );
-                        true
-                    }
+                let current_identity_digest = match km_uuid.to_security_level() {
+                    Some(SecurityLevel::TRUSTED_ENVIRONMENT) => tee_identity_digest,
+                    Some(SecurityLevel::STRONGBOX) => strongbox_identity_digest,
+                    _ => None,
                 };
-                if retire {
+                let Some(current_identity_digest) = current_identity_digest else {
+                    return Ok(());
+                };
+                let prefix: Vec<u8> =
+                    row.get(2).context("Failed to read stale keybox attestation metadata.")?;
+                if prefix != current_identity_digest[..KEYBOX_DIGEST_PREFIX_BYTES] {
                     stale_keys.push((key_id, km_uuid));
                 }
                 Ok(())
@@ -2016,7 +2056,7 @@ impl KeystoreDB {
             tx.execute(
                 "DELETE FROM persistent.keymetadata
                  WHERE keyentryid = ? AND tag = ?;",
-                params![key_id, KeyMetaData::KeyboxAttestationUuidPrefix],
+                params![key_id, KeyMetaData::KeyboxAttestationDigestPrefix],
             )
             .context("Trying to clear keybox attestation metadata.")?;
         }
@@ -3558,9 +3598,11 @@ mod tests {
         metadata.store_in_db(key_id + 100, tx).unwrap();
     }
 
-    fn add_keybox_attestation_metadata(tx: &Transaction, key_id: i64, km_uuid: Uuid) {
+    fn add_keybox_attestation_metadata(tx: &Transaction, key_id: i64, digest: [u8; 32]) {
         let mut metadata = KeyMetaData::new();
-        metadata.add(KeyMetaEntry::KeyboxAttestationUuidPrefix(km_uuid.get_digest().to_vec()));
+        metadata.add(KeyMetaEntry::KeyboxAttestationDigestPrefix(
+            digest[..KEYBOX_DIGEST_PREFIX_BYTES].to_vec(),
+        ));
         metadata.store_in_db(key_id, tx).unwrap();
     }
 
@@ -3624,7 +3666,7 @@ mod tests {
                 blob BLOB{state_column});
              INSERT INTO persistent.keyentry
                 (id, key_type, domain, namespace, alias, state, km_uuid)
-                VALUES (1, 0, 0, 0, X'01', 1, X'00000000000000000000000000000000');
+                VALUES (1, 0, 0, 0, X'01', 1, X'11111111111111111111111100000001');
              INSERT INTO persistent.blobentry
                 (id, subcomponent_type, keyentryid, blob)
                 VALUES (10, 0, 1, X'01'), (11, 0, 1, X'02');"
@@ -3646,87 +3688,297 @@ mod tests {
     }
 
     #[test]
-    fn uuid_from_keybox_digest_uses_digest_prefix_and_security_level() {
-        let mut digest = [0u8; 32];
-        for (index, byte) in digest.iter_mut().enumerate() {
-            *byte = index as u8;
+    fn uuid_decoding_accepts_only_fixed_security_level_uuids() {
+        for level in [SecurityLevel::TRUSTED_ENVIRONMENT, SecurityLevel::STRONGBOX] {
+            assert_eq!(Uuid::from(level).to_security_level(), Some(level));
         }
-
-        let uuid = Uuid::from_keybox_digest(SecurityLevel::STRONGBOX, digest);
-
-        assert_eq!(&uuid.0[..KEYBOX_UUID_DIGEST_BYTES], &digest[..KEYBOX_UUID_DIGEST_BYTES]);
-        assert_eq!(
-            &uuid.0[KEYBOX_UUID_DIGEST_BYTES..],
-            &(SecurityLevel::STRONGBOX.0 as u32).to_be_bytes()
-        );
-        assert_eq!(uuid.to_security_level(), Some(SecurityLevel::STRONGBOX));
-        assert!(uuid.is_keybox_bound());
-        assert!(uuid.is_bound_to_keybox_digest(digest));
-
-        let mut other_digest = digest;
-        other_digest[0] ^= 0xff;
-        assert!(!uuid.is_bound_to_keybox_digest(other_digest));
+        assert_eq!(KEYSTORE_UUID.to_security_level(), None);
     }
 
     #[test]
-    fn retire_stale_keybox_bound_entries_keeps_current_and_keystore_entries() {
-        let current_digest = [0x11; 32];
-        let stale_digest = [0x22; 32];
-        let current_uuid =
-            Uuid::from_keybox_digest(SecurityLevel::TRUSTED_ENVIRONMENT, current_digest);
-        let stale_tee_uuid =
-            Uuid::from_keybox_digest(SecurityLevel::TRUSTED_ENVIRONMENT, stale_digest);
-        let stale_strongbox_uuid = Uuid::from_keybox_digest(SecurityLevel::STRONGBOX, stale_digest);
-        let mut db = make_test_db();
-
+    fn v4_upgrade_keeps_key_lookup_and_isolates_strongbox_retirement() {
+        let tee_digest = [b'a'; 32];
+        let strongbox_digest = [b'b'; 32];
+        let tee = Uuid::from(SecurityLevel::TRUSTED_ENVIRONMENT);
+        let strongbox = Uuid::from(SecurityLevel::STRONGBOX);
+        let v4_tee = Uuid(*b"aaaaaaaaaaaa\0\0\0\x01");
+        let v4_shared_strongbox = Uuid(*b"aaaaaaaaaaaa\0\0\0\x02");
+        let v4_dedicated_strongbox = Uuid(*b"bbbbbbbbbbbb\0\0\0\x02");
+        let keys = [
+            (1, "tee", v4_tee, tee, Some(tee_digest)),
+            (2, "old-strongbox", v4_shared_strongbox, strongbox, Some(tee_digest)),
+            (3, "current-strongbox", v4_dedicated_strongbox, strongbox, Some(strongbox_digest)),
+            (4, "pure-cert", KEYSTORE_UUID, KEYSTORE_UUID, None),
+            (5, "boot_level_key", v4_tee, tee, None),
+            (6, "mismatched-digest", v4_shared_strongbox, strongbox, Some(strongbox_digest)),
+            (7, "zero-digest", strongbox, strongbox, Some([0; 32])),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let version = |tx: &Transaction| {
+            tx.query_row("SELECT version FROM persistent.version;", [], |row| row.get::<_, u32>(0))
+                .unwrap()
+        };
         {
+            let mut db = KeystoreDB::new(dir.path(), None).unwrap();
             let tx = db.conn.transaction().unwrap();
-            insert_live_client_key(&tx, 1, stale_tee_uuid, "stale-tee");
-            insert_live_client_key(&tx, 2, stale_strongbox_uuid, "stale-strongbox");
-            insert_live_client_key(&tx, 3, current_uuid, "current-keybox");
-            insert_live_client_key(&tx, 4, KEYSTORE_UUID, "keystore");
-            insert_live_client_key(&tx, 5, stale_tee_uuid, "stale-without-metadata");
-            add_keybox_attestation_metadata(&tx, 1, stale_tee_uuid);
-            add_keybox_attestation_metadata(&tx, 2, stale_strongbox_uuid);
-            add_keybox_attestation_metadata(&tx, 3, current_uuid);
+            assert_eq!(version(&tx), 5);
+            versioning::update_version(&tx, 4).unwrap();
+            tx.execute("DROP TABLE persistent.keybox_state;", []).unwrap();
+            for (id, alias, old_uuid, _, digest) in keys {
+                insert_live_client_key(&tx, id, old_uuid, alias);
+                if let Some(digest) = digest {
+                    add_keybox_attestation_metadata(&tx, id, digest);
+                }
+            }
+            tx.execute(
+                "UPDATE persistent.blobentry SET subcomponent_type = ? WHERE id = 104;",
+                params![SubComponentType::CERT],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO persistent.blobentry (id, subcomponent_type, keyentryid, blob, state)
+                 VALUES (201, 0, 5, X'AA', ?), (202, 0, 200, X'BB', ?);",
+                params![BlobState::Superseded, BlobState::Orphaned],
+            )
+            .unwrap();
+            for (blob_id, uuid) in [(105, v4_tee), (201, v4_tee), (202, v4_shared_strongbox)] {
+                let mut metadata = BlobMetaData::new();
+                metadata.add(BlobMetaEntry::KmUuid(uuid));
+                metadata.store_in_db(blob_id, &tx).unwrap();
+            }
             tx.commit().unwrap();
         }
 
-        assert_eq!(2, db.retire_stale_keybox_bound_entries(current_digest).unwrap());
+        let lookup = |tx: &Transaction, alias: &str| {
+            KeystoreDB::load_key_entry_id(
+                tx,
+                &KeyDescriptor {
+                    domain: Domain::APP,
+                    nspace: TEST_NAMESPACE,
+                    alias: Some(alias.to_string()),
+                    blob: None,
+                },
+                KeyType::Client,
+            )
+        };
+        for _ in 0..2 {
+            let mut db = KeystoreDB::new(dir.path(), None).unwrap();
+            assert_eq!(
+                0,
+                db.retire_stale_keybox_bound_entries(Some(tee_digest), Some(tee_digest), true)
+                    .unwrap()
+            );
+            let tx = db.conn.transaction().unwrap();
+            assert_eq!(version(&tx), 5);
+            for (id, alias, _, uuid, digest) in keys {
+                assert_eq!(lookup(&tx, alias).unwrap(), id);
+                let migrated_uuid = tx
+                    .query_row(
+                        "SELECT km_uuid FROM persistent.keyentry WHERE id = ?;",
+                        [id],
+                        |row| row.get::<_, Uuid>(0),
+                    )
+                    .unwrap();
+                assert_eq!(migrated_uuid, uuid);
+                let metadata = KeyMetaData::load_from_db(id, &tx).unwrap();
+                let expected = digest.filter(|_| id <= 3);
+                assert_eq!(
+                    metadata.keybox_attestation_digest_prefix().map(Vec::as_slice),
+                    expected.as_ref().map(|value| &value[..KEYBOX_DIGEST_PREFIX_BYTES]),
+                );
+            }
+            for (blob_id, uuid, blob, state) in [
+                (104, None, vec![4], BlobState::Current),
+                (105, Some(tee), vec![5], BlobState::Current),
+                (201, Some(tee), vec![0xaa], BlobState::Superseded),
+                (202, Some(strongbox), vec![0xbb], BlobState::Orphaned),
+            ] {
+                let metadata = BlobMetaData::load_from_db(blob_id, &tx).unwrap();
+                assert_eq!(metadata.km_uuid().copied(), uuid);
+                let row = tx
+                    .query_row(
+                        "SELECT blob, state FROM persistent.blobentry WHERE id = ?;",
+                        [blob_id],
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, BlobState>(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(row, (blob, state));
+            }
+        }
 
-        assert_eq!(0, key_entry_count(&db, 1));
-        assert_eq!(0, key_entry_count(&db, 2));
-        assert_eq!(1, key_entry_count(&db, 3));
-        assert_eq!(1, key_entry_count(&db, 4));
-        assert_eq!(1, key_entry_count(&db, 5));
-        assert_eq!(BlobState::Orphaned, blob_state(&db, 1));
+        let mut db = KeystoreDB::new(dir.path(), None).unwrap();
+        assert_eq!(0, db.retire_stale_keybox_bound_entries(Some(tee_digest), None, true).unwrap());
+        assert_eq!(
+            0,
+            db.retire_stale_keybox_bound_entries(Some(tee_digest), Some(strongbox_digest), false)
+                .unwrap()
+        );
+        drop(db);
+        let mut db = KeystoreDB::new(dir.path(), None).unwrap();
+        assert_eq!(
+            1,
+            db.retire_stale_keybox_bound_entries(Some(tee_digest), Some(strongbox_digest), true)
+                .unwrap()
+        );
+        let tx = db.conn.transaction().unwrap();
+        assert!(matches!(
+            lookup(&tx, "old-strongbox").unwrap_err().root_cause().downcast_ref::<KsError>(),
+            Some(KsError::Rc(ResponseCode::KEY_NOT_FOUND))
+        ));
+        for (id, alias, _, _, _) in keys.into_iter().filter(|(id, ..)| *id != 2) {
+            assert_eq!(lookup(&tx, alias).unwrap(), id);
+        }
+        tx.commit().unwrap();
         assert_eq!(BlobState::Orphaned, blob_state(&db, 2));
-        assert_eq!(BlobState::Current, blob_state(&db, 3));
-        assert_eq!(BlobState::Current, blob_state(&db, 4));
-        assert_eq!(BlobState::Current, blob_state(&db, 5));
+    }
+
+    #[test]
+    fn v4_upgrade_preserves_attested_key_operations() {
+        use crate::android::hardware::security::keymint::{
+            IKeyMintDevice::IKeyMintDevice, KeyPurpose::KeyPurpose as AidlPurpose,
+        };
+        use crate::keymaster::keymint_device::{
+            tests::attestation_wrapper, KeyMintDevice, KeyMintWrapper,
+        };
+        use crate::keymaster::utils::{key_characteristics_to_internal, key_params_to_aidl};
+        use kmr_wire::keymint::{
+            Algorithm, DateTime as KmDateTime, Digest, EcCurve, KeyParam, KeyPurpose,
+        };
+
+        let version = KeyMintDevice::KEY_MINT_V5;
+        let generate_params = key_params_to_aidl(
+            &[
+                KeyParam::Purpose(KeyPurpose::Sign),
+                KeyParam::Algorithm(Algorithm::Ec),
+                KeyParam::EcCurve(EcCurve::P256),
+                KeyParam::Digest(Digest::Sha256),
+                KeyParam::NoAuthRequired,
+                KeyParam::CertificateNotBefore(KmDateTime { ms_since_epoch: 0 }),
+                KeyParam::CertificateNotAfter(KmDateTime { ms_since_epoch: 2_000_000_000_000 }),
+                KeyParam::AttestationChallenge(b"migration test".to_vec()),
+                KeyParam::AttestationApplicationId(vec![0x30, 0]),
+            ],
+            version,
+        )
+        .unwrap();
+        let operation_params =
+            key_params_to_aidl(&[KeyParam::Digest(Digest::Sha256)], version).unwrap();
+        let message = b"same key before and after migration";
+        let sign = |device: &KeyMintWrapper, blob: &[u8]| {
+            device
+                .begin(AidlPurpose::SIGN, blob, &operation_params, None)
+                .unwrap()
+                .operation
+                .unwrap()
+                .finish(Some(message), None, None, None, None)
+                .unwrap()
+        };
+
+        for (level, v4_uuid) in [
+            (SecurityLevel::TRUSTED_ENVIRONMENT, Uuid(*b"aaaaaaaaaaaa\0\0\0\x01")),
+            (SecurityLevel::STRONGBOX, Uuid(*b"aaaaaaaaaaaa\0\0\0\x02")),
+        ] {
+            let old_device = attestation_wrapper(level);
+            let created = old_device.generateKey(&generate_params, None).unwrap();
+            let (leaf, issuers) = created.certificateChain.split_first().unwrap();
+            assert!(!issuers.is_empty());
+            let chain: Vec<u8> =
+                issuers.iter().flat_map(|cert| cert.encodedCertificate.iter().copied()).collect();
+            let certs =
+                CertificateInfo::new(Some(leaf.encodedCertificate.clone()), Some(chain.clone()));
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = KeystoreDB::new(dir.path(), None).unwrap();
+            let tx = db.conn.transaction().unwrap();
+            versioning::update_version(&tx, 4).unwrap();
+            tx.execute("DROP TABLE persistent.keybox_state;", []).unwrap();
+            tx.commit().unwrap();
+            let desc = KeyDescriptor {
+                domain: Domain::APP,
+                nspace: TEST_NAMESPACE,
+                alias: Some("attested-before-upgrade".into()),
+                blob: None,
+            };
+            let mut blob_metadata = BlobMetaData::new();
+            blob_metadata.add(BlobMetaEntry::KmUuid(v4_uuid));
+            let mut key_metadata = KeyMetaData::new();
+            key_metadata.add(KeyMetaEntry::KeyboxAttestationDigestPrefix(
+                vec![b'a'; KEYBOX_DIGEST_PREFIX_BYTES],
+            ));
+            let old_id = db
+                .store_new_key(
+                    &desc,
+                    KeyType::Client,
+                    &key_characteristics_to_internal(created.keyCharacteristics),
+                    &BlobInfo::new(&created.keyBlob, &blob_metadata),
+                    &certs,
+                    &key_metadata,
+                    &v4_uuid,
+                )
+                .unwrap()
+                .id();
+            assert!(!sign(&old_device, &created.keyBlob).is_empty());
+            drop(db);
+
+            let mut db = KeystoreDB::new(dir.path(), None).unwrap();
+            let current_digest = crate::keybox::current_identity_digest(level);
+            assert_eq!(
+                0,
+                db.retire_stale_keybox_bound_entries(
+                    Some(current_digest),
+                    Some(current_digest),
+                    true
+                )
+                .unwrap()
+            );
+            let (id, mut entry) = db
+                .load_key_entry(
+                    &desc,
+                    KeyType::Client,
+                    KeyEntryLoadBits::BOTH,
+                    AppUid(TEST_NAMESPACE),
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(id.id(), old_id);
+            assert_eq!(entry.km_uuid().to_security_level(), Some(level));
+            assert_eq!(entry.take_cert().as_deref(), Some(leaf.encodedCertificate.as_slice()));
+            assert_eq!(entry.take_cert_chain(), Some(chain));
+            let (blob, metadata) = entry.take_key_blob_info().unwrap();
+            assert_eq!(blob, created.keyBlob);
+            assert_eq!(metadata.km_uuid(), Some(&Uuid::from(level)));
+
+            let new_device = attestation_wrapper(level);
+            assert!(!sign(&new_device, &blob).is_empty());
+        }
     }
 
     #[test]
     fn alias_can_be_reused_after_stale_keybox_entry_is_retired() {
         let current_digest = [0x33; 32];
         let stale_digest = [0x44; 32];
-        let current_uuid =
-            Uuid::from_keybox_digest(SecurityLevel::TRUSTED_ENVIRONMENT, current_digest);
-        let stale_uuid = Uuid::from_keybox_digest(SecurityLevel::TRUSTED_ENVIRONMENT, stale_digest);
+        let tee_uuid = Uuid::from(SecurityLevel::TRUSTED_ENVIRONMENT);
         let mut db = make_test_db();
 
         {
             let tx = db.conn.transaction().unwrap();
-            insert_live_client_key(&tx, 1, stale_uuid, "shared-alias");
-            add_keybox_attestation_metadata(&tx, 1, stale_uuid);
+            insert_live_client_key(&tx, 1, tee_uuid, "shared-alias");
+            add_keybox_attestation_metadata(&tx, 1, stale_digest);
             tx.commit().unwrap();
         }
 
-        assert_eq!(1, db.retire_stale_keybox_bound_entries(current_digest).unwrap());
+        assert_eq!(
+            0,
+            db.retire_stale_keybox_bound_entries(Some(stale_digest), None, true).unwrap()
+        );
+        assert_eq!(
+            1,
+            db.retire_stale_keybox_bound_entries(Some(current_digest), None, true).unwrap()
+        );
 
         {
             let tx = db.conn.transaction().unwrap();
-            insert_live_client_key(&tx, 2, current_uuid, "shared-alias");
+            insert_live_client_key(&tx, 2, tee_uuid, "shared-alias");
             let descriptor = KeyDescriptor {
                 domain: Domain::APP,
                 nspace: TEST_NAMESPACE,
@@ -3791,10 +4043,19 @@ mod tests {
             }
 
             assert_eq!(
-                4,
+                5,
                 conn.query_row("SELECT version FROM persistent.version WHERE id = 0;", [], |row| {
                     row.get::<_, u32>(0)
                 })
+                .unwrap()
+            );
+            assert_eq!(
+                Uuid::from(SecurityLevel::TRUSTED_ENVIRONMENT),
+                conn.query_row(
+                    "SELECT km_uuid FROM persistent.keyentry WHERE id = 1;",
+                    [],
+                    |row| { row.get::<_, Uuid>(0) }
+                )
                 .unwrap()
             );
             assert_eq!(

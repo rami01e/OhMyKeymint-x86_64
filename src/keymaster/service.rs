@@ -72,7 +72,6 @@ impl Default for KeystoreService {
 struct SecurityLevels {
     i_sec_level_by_uuid: HashMap<Uuid, Strong<dyn IKeystoreSecurityLevel>>,
     i_osec_level_by_uuid: HashMap<Uuid, Strong<dyn IOhMySecurityLevel>>,
-    uuid_by_sec_level: HashMap<SecurityLevel, Uuid>,
 }
 
 impl KeystoreService {
@@ -83,8 +82,7 @@ impl KeystoreService {
             ..Default::default()
         };
 
-        let retired = result
-            .retire_stale_keybox_bound_entries()
+        let retired = keybox::retire_stale_keybox_bound_entries()
             .context(err!("retiring stale keybox-bound entries during service startup"))?;
         if retired != 0 {
             log::info!("retired {retired} stale keybox-bound entries during service startup");
@@ -114,124 +112,38 @@ impl KeystoreService {
         Ok(result)
     }
 
-    fn retire_stale_keybox_bound_entries(&self) -> Result<usize> {
-        if !keybox::db_retirement_allowed() {
-            log::debug!(
-                "Skipping stale keybox-bound entry retirement (disabled or keybox fallback active)."
-            );
-            return Ok(0);
+    fn register_security_level(&self, sec_level: SecurityLevel) -> Result<()> {
+        let uuid = Uuid::from(sec_level);
+        if self.security_levels.read().unwrap().i_sec_level_by_uuid.contains_key(&uuid) {
+            return Ok(());
         }
-
-        DB.with(|db| {
-            db.borrow_mut().retire_stale_keybox_bound_entries(keybox::current_identity_digest())
-        })
-    }
-
-    fn ensure_security_levels_current(&self) -> Result<()> {
-        let tee_uuid = Uuid::from(SecurityLevel::TRUSTED_ENVIRONMENT);
-        let refresh_tee = {
-            let security_levels = self.security_levels.read().unwrap();
-            security_levels.uuid_by_sec_level.get(&SecurityLevel::TRUSTED_ENVIRONMENT).copied()
-                != Some(tee_uuid)
-        };
-
-        if refresh_tee {
-            self.register_security_level(SecurityLevel::TRUSTED_ENVIRONMENT)
-                .context(err!("refreshing TEE security level after keybox change"))?;
+        debug!("Registering security level {sec_level:?}");
+        let (binder, private) =
+            KeystoreSecurityLevel::new_binders(sec_level, self.id_rotation_state.clone())?;
+        let mut levels = self.security_levels.write().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            levels.i_sec_level_by_uuid.entry(uuid)
+        {
+            entry.insert(binder);
+            levels.i_osec_level_by_uuid.insert(uuid, private);
         }
-
-        if self.strongbox_enabled {
-            let strongbox_uuid = Uuid::from(SecurityLevel::STRONGBOX);
-            let refresh_strongbox = {
-                let security_levels = self.security_levels.read().unwrap();
-                security_levels.uuid_by_sec_level.get(&SecurityLevel::STRONGBOX).copied()
-                    != Some(strongbox_uuid)
-            };
-
-            if refresh_strongbox {
-                if let Err(error) = self.register_security_level(SecurityLevel::STRONGBOX) {
-                    log::warn!(
-                        "Failed to refresh optional StrongBox security level after keybox change: {error:#}"
-                    );
-                }
-            }
-        }
-
         Ok(())
     }
 
-    fn register_security_level(&self, sec_level: SecurityLevel) -> Result<()> {
-        debug!("Registering security level {sec_level:?}");
-        loop {
-            let uuid = Uuid::from(sec_level);
-            let previous =
-                self.security_levels.read().unwrap().uuid_by_sec_level.get(&sec_level).copied();
-            if previous == Some(uuid) {
-                return Ok(());
+    fn retry_strongbox_registration(&self, uuid: &Uuid) {
+        if self.strongbox_enabled && *uuid == Uuid::from(SecurityLevel::STRONGBOX) {
+            if let Err(error) = self.register_security_level(SecurityLevel::STRONGBOX) {
+                log::warn!("Failed to register optional StrongBox security level: {error:#}");
             }
-            if previous.is_some() {
-                self.retire_stale_keybox_bound_entries()
-                    .context(err!("retiring stale keybox-bound entries before UUID refresh"))?;
-            }
-            let candidate = if previous.is_none() {
-                Some(KeystoreSecurityLevel::new_binders(sec_level, self.id_rotation_state.clone())?)
-            } else {
-                None
-            };
-            let mut levels = self.security_levels.write().unwrap();
-            if levels.uuid_by_sec_level.get(&sec_level).copied() != previous {
-                drop(levels);
-                drop(candidate);
-                continue;
-            }
-            let (binder, private) = match previous {
-                Some(previous) => (
-                    levels
-                        .i_sec_level_by_uuid
-                        .remove(&previous)
-                        .expect("registered security level"),
-                    levels
-                        .i_osec_level_by_uuid
-                        .remove(&previous)
-                        .expect("registered private security level"),
-                ),
-                None => candidate.expect("new security level"),
-            };
-            levels.i_sec_level_by_uuid.insert(uuid, binder);
-            levels.i_osec_level_by_uuid.insert(uuid, private);
-            levels.uuid_by_sec_level.insert(sec_level, uuid);
-            return Ok(());
         }
     }
 
-    fn uuid_to_sec_level(&self, uuid: &Uuid) -> SecurityLevel {
-        let security_levels = self.security_levels.read().unwrap();
-        security_levels
-            .uuid_by_sec_level
-            .iter()
-            .find(|(_, v)| **v == *uuid)
-            .map(|(s, _)| *s)
-            .or_else(|| {
-                uuid.is_keybox_bound()
-                    .then(|| uuid.to_security_level())
-                    .flatten()
-                    .filter(|s| security_levels.uuid_by_sec_level.contains_key(s))
-            })
-            .unwrap_or(SecurityLevel::SOFTWARE)
-    }
-
     fn get_i_sec_level_by_uuid(&self, uuid: &Uuid) -> Result<Strong<dyn IKeystoreSecurityLevel>> {
+        self.retry_strongbox_registration(uuid);
         let security_levels = self.security_levels.read().unwrap();
         security_levels
             .i_sec_level_by_uuid
             .get(uuid)
-            .or_else(|| {
-                uuid.is_keybox_bound()
-                    .then(|| uuid.to_security_level())
-                    .flatten()
-                    .and_then(|s| security_levels.uuid_by_sec_level.get(&s))
-                    .and_then(|uuid| security_levels.i_sec_level_by_uuid.get(uuid))
-            })
             .cloned()
             .ok_or_else(Error::sys)
             .context(err!("KeyMint instance for key not found."))
@@ -241,13 +153,10 @@ impl KeystoreService {
         &self,
         sec_level: SecurityLevel,
     ) -> Result<Strong<dyn IKeystoreSecurityLevel>> {
-        self.ensure_security_levels_current()?;
+        let uuid = Uuid::from(sec_level);
+        self.retry_strongbox_registration(&uuid);
         let security_levels = self.security_levels.read().unwrap();
-        if let Some(dev) = security_levels
-            .uuid_by_sec_level
-            .get(&sec_level)
-            .and_then(|uuid| security_levels.i_sec_level_by_uuid.get(uuid))
-        {
+        if let Some(dev) = security_levels.i_sec_level_by_uuid.get(&uuid) {
             Ok(dev.clone())
         } else {
             Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
@@ -259,13 +168,10 @@ impl KeystoreService {
         &self,
         sec_level: SecurityLevel,
     ) -> Result<Strong<dyn IOhMySecurityLevel>> {
-        self.ensure_security_levels_current()?;
+        let uuid = Uuid::from(sec_level);
+        self.retry_strongbox_registration(&uuid);
         let security_levels = self.security_levels.read().unwrap();
-        if let Some(dev) = security_levels
-            .uuid_by_sec_level
-            .get(&sec_level)
-            .and_then(|uuid| security_levels.i_osec_level_by_uuid.get(uuid))
-        {
+        if let Some(dev) = security_levels.i_osec_level_by_uuid.get(&uuid) {
             Ok(dev.clone())
         } else {
             Err(Error::Km(ErrorCode::HARDWARE_TYPE_UNAVAILABLE))
@@ -278,7 +184,6 @@ impl KeystoreService {
         ctx: Option<&CallerInfo>,
         key: &KeyDescriptor,
     ) -> Result<KeyEntryResponse> {
-        self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
 
         let _super_key = SUPER_KEY
@@ -315,7 +220,10 @@ impl KeystoreService {
                     nspace: key_id_guard.id(),
                     ..Default::default()
                 },
-                keySecurityLevel: self.uuid_to_sec_level(key_entry.km_uuid()),
+                keySecurityLevel: key_entry
+                    .km_uuid()
+                    .to_security_level()
+                    .unwrap_or(SecurityLevel::SOFTWARE),
                 certificate: key_entry.take_cert(),
                 certificateChain: key_entry.take_cert_chain(),
                 modificationTimeMs: key_entry
@@ -336,7 +244,6 @@ impl KeystoreService {
         public_cert: Option<&[u8]>,
         certificate_chain: Option<&[u8]>,
     ) -> Result<()> {
-        self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
         let _super_key = SUPER_KEY
             .read()
@@ -415,7 +322,6 @@ impl KeystoreService {
         domain: Domain,
         namespace: i64,
     ) -> Result<KeyDescriptor> {
-        self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
 
         let mut k = match domain {
@@ -488,7 +394,6 @@ impl KeystoreService {
     }
 
     fn delete_key(&self, ctx: Option<&CallerInfo>, key: &KeyDescriptor) -> Result<()> {
-        self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
         let _super_key = SUPER_KEY
             .read()
@@ -511,7 +416,6 @@ impl KeystoreService {
         grantee_uid: i32,
         access_vector: KeyPermSet,
     ) -> Result<KeyDescriptor> {
-        self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
         let _super_key = SUPER_KEY
             .read()
@@ -536,7 +440,6 @@ impl KeystoreService {
         key: &KeyDescriptor,
         grantee_uid: i32,
     ) -> Result<()> {
-        self.ensure_security_levels_current()?;
         let caller_uid = calling_uid(ctx);
         DB.with(|db| {
             db.borrow_mut().ungrant(key, caller_uid, AppUid(grantee_uid as i64), |k| {
@@ -789,7 +692,6 @@ impl IOhMyKsService for KeystoreService {
             .collect();
 
         keybox::update_ec_keybox(key.to_vec(), chain).map_err(into_logged_binder)?;
-        self.ensure_security_levels_current().map_err(into_logged_binder)?;
         Ok(())
     }
 
@@ -809,7 +711,6 @@ impl IOhMyKsService for KeystoreService {
             .collect();
 
         keybox::update_rsa_keybox(key.to_vec(), chain).map_err(into_logged_binder)?;
-        self.ensure_security_levels_current().map_err(into_logged_binder)?;
         Ok(())
     }
 
@@ -835,10 +736,9 @@ impl IOhMyKsService for KeystoreService {
 mod tests {
     use super::*;
     use crate::android::system::keystore2::IKeystoreSecurityLevel::BnKeystoreSecurityLevel;
-    use std::sync::Arc;
 
     #[test]
-    fn uuid_refresh_reuses_the_level_binder_under_concurrent_lookups() {
+    fn fixed_uuid_keeps_the_registered_binders() {
         let (_private_directory, private_level) =
             super::super::security_level::tests::test_security_level();
         let private_level =
@@ -849,37 +749,23 @@ mod tests {
         let (_directory, level) = super::super::security_level::tests::test_security_level();
         let binder = BnKeystoreSecurityLevel::new_binder(level, crate::consts::sid_features());
         let security_level = SecurityLevel::TRUSTED_ENVIRONMENT;
-        let current = Uuid::from(security_level);
-        let mut digest = keybox::current_identity_digest();
-        digest[0] ^= 0xff;
-        let previous = Uuid::from_keybox_digest(security_level, digest);
-        let service = Arc::new(KeystoreService::default());
+        let uuid = Uuid::from(security_level);
+        let service = KeystoreService::default();
         {
             let mut levels = service.security_levels.write().unwrap();
-            levels.i_sec_level_by_uuid.insert(previous, binder.clone());
-            levels.i_osec_level_by_uuid.insert(previous, private_level);
-            levels.uuid_by_sec_level.insert(security_level, previous);
+            levels.i_sec_level_by_uuid.insert(uuid, binder.clone());
+            levels.i_osec_level_by_uuid.insert(uuid, private_level.clone());
         }
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                let service = Arc::clone(&service);
-                let expected = binder.as_binder();
-                scope.spawn(move || {
-                    assert_eq!(
-                        service.get_security_level(security_level).unwrap().as_binder(),
-                        expected
-                    );
-                });
-            }
-        });
-        let levels = service.security_levels.read().unwrap();
-        assert_eq!(levels.uuid_by_sec_level[&security_level], current);
-        assert!(!levels.i_sec_level_by_uuid.contains_key(&previous));
-        assert_eq!(levels.i_sec_level_by_uuid.len(), 1);
-        drop(levels);
+        service.register_security_level(security_level).unwrap();
+        assert_eq!(service.get_i_sec_level_by_uuid(&uuid).unwrap().as_binder(), binder.as_binder());
         assert_eq!(
-            service.get_i_sec_level_by_uuid(&previous).unwrap().as_binder(),
+            service.get_security_level(security_level).unwrap().as_binder(),
             binder.as_binder()
         );
+        assert_eq!(
+            service.get_iohmy_security_level(security_level).unwrap().as_binder(),
+            private_level.as_binder()
+        );
+        assert!(service.get_security_level(SecurityLevel::STRONGBOX).is_err());
     }
 }

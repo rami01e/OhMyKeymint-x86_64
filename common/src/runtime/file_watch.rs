@@ -29,6 +29,7 @@ pub enum WatchTrigger {
     ReplaceSave,
     Polling,
     Overflow,
+    Rescan,
 }
 
 impl WatchTrigger {
@@ -38,6 +39,7 @@ impl WatchTrigger {
             Self::ReplaceSave => "replace-save",
             Self::Polling => "polling",
             Self::Overflow => "overflow",
+            Self::Rescan => "rescan",
         }
     }
 
@@ -50,7 +52,7 @@ impl WatchTrigger {
             Self::CloseWrite => 0,
             Self::Overflow => 1,
             Self::ReplaceSave => 2,
-            Self::Polling => 3,
+            Self::Polling | Self::Rescan => 3,
         }
     }
 
@@ -64,24 +66,32 @@ impl WatchTrigger {
         if (mask & libc::IN_CLOSE_WRITE) != 0 {
             return Some(Self::CloseWrite);
         }
+        if (mask & (libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_ATTRIB)) != 0 {
+            return Some(Self::Rescan);
+        }
         None
     }
 }
 
-pub fn spawn_path_watcher<F>(thread_name: &str, path: PathBuf, on_change: F) -> Result<()>
+pub fn spawn_path_watcher<F>(
+    thread_name: &str,
+    path: PathBuf,
+    watch_presence: bool,
+    on_change: F,
+) -> Result<()>
 where
     F: Fn(WatchTrigger) + Send + Sync + 'static,
 {
     thread::Builder::new()
         .name(thread_name.to_string())
         .spawn(move || {
-            if let Err(error) = watch_loop_inotify(&path, &on_change) {
+            if let Err(error) = watch_loop_inotify(&path, watch_presence, &on_change) {
                 log::error!(
                     "inotify watcher failed for {}: {}; falling back to polling",
                     path.display(),
                     error
                 );
-                watch_loop_polling(&path, &on_change);
+                watch_loop_polling(&path, watch_presence, &on_change);
             }
         })
         .with_context(|| format!("failed to spawn watcher thread {thread_name}"))?;
@@ -93,11 +103,14 @@ fn inspect_path(path: &Path) -> Option<(u64, Option<SystemTime>)> {
     Some((metadata.len(), metadata.modified().ok()))
 }
 
-fn watch_loop_polling<F>(path: &Path, callback: &F)
+fn watch_loop_polling<F>(path: &Path, watch_presence: bool, callback: &F)
 where
     F: Fn(WatchTrigger) + Send + Sync + 'static,
 {
     let mut last_seen = inspect_path(path);
+    if watch_presence {
+        callback(WatchTrigger::Rescan);
+    }
     loop {
         thread::sleep(WATCH_INTERVAL);
 
@@ -110,7 +123,7 @@ where
     }
 }
 
-fn watch_loop_inotify<F>(path: &Path, callback: &F) -> io::Result<()>
+fn watch_loop_inotify<F>(path: &Path, watch_presence: bool, callback: &F) -> io::Result<()>
 where
     F: Fn(WatchTrigger) + Send + Sync + 'static,
 {
@@ -135,8 +148,11 @@ where
             format!("watch path contains NUL byte: {}", parent.display()),
         )
     })?;
-    let watch_mask =
+    let mut watch_mask =
         libc::IN_CLOSE_WRITE | libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_Q_OVERFLOW;
+    if watch_presence {
+        watch_mask |= libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_ATTRIB;
+    }
 
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if fd < 0 {
@@ -150,6 +166,9 @@ where
             libc::close(fd);
         }
         return Err(error);
+    }
+    if watch_presence {
+        callback(WatchTrigger::Rescan);
     }
 
     let watched_name = file_name.as_bytes().to_vec();

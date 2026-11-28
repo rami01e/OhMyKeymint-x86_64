@@ -130,6 +130,7 @@ fn prepare_android_storage() {
         root_path!("config.toml"),
         root_path!("config.toml.bak"),
         root_path!("keybox.xml"),
+        root_path!("keybox_strongbox.xml"),
         root_path!("crash_count"),
         root_path!("logs/keymint.log"),
         root_path!("logs/keymint.log.1"),

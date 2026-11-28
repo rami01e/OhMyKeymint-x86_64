@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock, RwLock,
+        OnceLock, RwLock, RwLockReadGuard,
     },
 };
 
@@ -25,13 +25,17 @@ use regex::Regex;
 use x509_cert::der as x509_der;
 use x509_cert::Certificate;
 
-pub const KEYBOX_PATH: &str = "/data/misc/keystore/omk/keybox.xml";
+use crate::{android::hardware::security::keymint::SecurityLevel::SecurityLevel, root_path};
+
+pub const KEYBOX_PATH: &str = root_path!("keybox.xml");
+pub const STRONGBOX_KEYBOX_PATH: &str = root_path!("keybox_strongbox.xml");
 
 const BUNDLED_KEYBOX_XML: &str = include_str!("../template/keybox.xml");
 
 lazy_static::lazy_static! {
     pub static ref KEYBOX: RwLock<KeyBox> = RwLock::new(KeyBox::new());
-    static ref KEYBOX_IO_LOCK: Mutex<()> = Mutex::new(());
+    static ref STRONGBOX_KEYBOX: RwLock<StrongboxKeybox> = RwLock::new(StrongboxKeybox::Missing);
+    static ref KEYBOX_IO_LOCK: RwLock<()> = RwLock::new(());
     static ref KEY_BLOCK_RE: Regex =
         Regex::new(r#"(?s)<Key\s+algorithm="([^"]+)">\s*(.*?)\s*</Key>"#).unwrap();
     static ref PRIVATE_KEY_RE: Regex =
@@ -60,6 +64,48 @@ pub struct KeyBox {
     identity_digest: [u8; 32],
 }
 
+enum StrongboxKeybox {
+    Missing,
+    Unavailable,
+    Loaded(Box<KeyBox>),
+}
+
+impl StrongboxKeybox {
+    fn dedicated(&self) -> Option<&KeyBox> {
+        match self {
+            Self::Loaded(keybox) => Some(keybox),
+            Self::Missing | Self::Unavailable => None,
+        }
+    }
+
+    fn retirement_identity(&self, tee_identity: Option<[u8; 32]>) -> Option<[u8; 32]> {
+        match self {
+            Self::Loaded(keybox) => Some(keybox.identity_digest()),
+            Self::Missing => tee_identity,
+            Self::Unavailable => None,
+        }
+    }
+
+    fn reload(&mut self, path: &Path) -> Result<()> {
+        let loaded = match fs::read_to_string(path) {
+            Ok(contents) => KeyBox::from_complete_xml(&contents).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        };
+        match loaded {
+            Ok(Some(keybox)) => *self = Self::Loaded(Box::new(keybox)),
+            Ok(None) => *self = Self::Missing,
+            Err(error) => {
+                if self.dedicated().is_none() {
+                    *self = Self::Unavailable;
+                }
+                return Err(error).with_context(|| format!("failed to load {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum KeyAlgorithm {
     Ec,
@@ -74,6 +120,23 @@ struct ParsedKeyEntry {
 impl KeyBox {
     pub fn new() -> Self {
         Self::from_xml_str(BUNDLED_KEYBOX_XML).expect("bundled keybox.xml must be valid")
+    }
+
+    fn from_complete_xml(xml: &str) -> Result<Self> {
+        use quick_xml::events::Event;
+
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut depth = 0;
+        loop {
+            match reader.read_event().context("invalid keybox XML")? {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth -= 1,
+                // A writer can expose a complete EC block before the rest of the keybox.
+                Event::Eof if depth != 0 => bail!("incomplete keybox XML"),
+                Event::Eof => return Self::from_xml_str(xml),
+                _ => {}
+            }
+        }
     }
 
     pub fn from_xml_str(xml: &str) -> Result<Self> {
@@ -479,26 +542,50 @@ fn is_bundled_keybox_xml(xml: &str) -> bool {
     xml.trim() == BUNDLED_KEYBOX_XML.trim()
 }
 
-fn retire_stale_keybox_bound_entries(current_identity: [u8; 32]) {
-    if !db_retirement_allowed() {
-        debug!("skipping stale keybox-bound DB retirement (disabled or fallback keybox active)");
-        return;
-    }
+pub(crate) fn retire_stale_keybox_bound_entries() -> Result<usize> {
+    let _io_guard = KEYBOX_IO_LOCK.write().unwrap();
+    let (tee, strongbox_refreshed) = reload_keyboxes_locked(false);
+    let tee_refreshed = tee.inspect_err(|error| warn!("{error:#}")).is_ok();
+    retire_stale_keybox_bound_entries_locked(tee_refreshed, strongbox_refreshed)
+}
 
-    match crate::global::DB
-        .with(|db| db.borrow_mut().retire_stale_keybox_bound_entries(current_identity))
-    {
+pub(crate) fn lock_attestation_identity() -> RwLockReadGuard<'static, ()> {
+    KEYBOX_IO_LOCK.read().unwrap()
+}
+
+fn retire_stale_keybox_bound_entries_locked(
+    tee_refreshed: bool,
+    strongbox_refreshed: bool,
+) -> Result<usize> {
+    let tee_identity = (tee_refreshed && KEYBOX_DB_RETIRE_ALLOWED.load(Ordering::Acquire))
+        .then(|| KEYBOX.read().unwrap().identity_digest());
+    let strongbox_identity = strongbox_refreshed
+        .then(|| STRONGBOX_KEYBOX.read().unwrap().retirement_identity(tee_identity))
+        .flatten();
+    if tee_identity.is_none() && strongbox_identity.is_none() {
+        return Ok(0);
+    }
+    let enabled = match crate::config::config().read() {
+        Ok(config) => config.main.retire_stale_keybox_bound_keys,
+        Err(_) => {
+            error!("config lock poisoned while checking keybox retirement");
+            false
+        }
+    };
+    crate::global::DB.with(|db| {
+        db.borrow_mut().retire_stale_keybox_bound_entries(tee_identity, strongbox_identity, enabled)
+    })
+}
+
+fn retire_after_reload(tee_refreshed: bool, strongbox_refreshed: bool) {
+    match retire_stale_keybox_bound_entries_locked(tee_refreshed, strongbox_refreshed) {
         Ok(0) => debug!("no stale keybox-bound key entries needed retirement"),
         Ok(retired) => info!("retired {retired} stale keybox-bound key entries"),
         Err(error) => error!("failed to retire stale keybox-bound key entries: {error:#}"),
     }
 }
 
-fn install_keybox(
-    new_keybox: KeyBox,
-    retire_db_entries: bool,
-    db_retirement_allowed: bool,
-) -> bool {
+fn install_keybox(new_keybox: KeyBox, db_retirement_allowed: bool) -> bool {
     let new_identity = new_keybox.identity_digest();
     let changed = {
         let mut keybox = KEYBOX.write().unwrap();
@@ -509,26 +596,7 @@ fn install_keybox(
     KEYBOX_DB_RETIRE_ALLOWED.store(db_retirement_allowed, Ordering::Release);
     KEYBOX_RUNTIME_LOADED.store(true, Ordering::Release);
 
-    if changed {
-        crate::keymaster::keymint_device::clear_initialized_attestation_caches();
-    }
-
-    if retire_db_entries {
-        retire_stale_keybox_bound_entries(new_identity);
-    }
-
     changed
-}
-
-pub fn db_retirement_allowed() -> bool {
-    KEYBOX_DB_RETIRE_ALLOWED.load(Ordering::Acquire)
-        && match crate::config::config().read() {
-            Ok(config) => config.main.retire_stale_keybox_bound_keys,
-            Err(_) => {
-                error!("config lock poisoned while checking keybox retirement");
-                false
-            }
-        }
 }
 
 fn is_fallback_continuation(keybox: &KeyBox, contents: &str) -> bool {
@@ -556,20 +624,31 @@ fn is_fallback_continuation_with_state(
         && current_identity == keybox.identity_digest()
 }
 
-fn load_keybox_with_fallback(path: &str) -> Result<(KeyBox, bool)> {
+fn load_tee_keybox(path: &str, restore_bundled: bool) -> Result<(KeyBox, bool)> {
     match fs::read_to_string(path) {
-        Ok(contents) => match KeyBox::from_xml_str(&contents) {
-            Ok(keybox) => {
-                let fallback_origin = is_fallback_continuation(&keybox, &contents);
-                Ok((keybox, fallback_origin))
+        Ok(contents) => {
+            let keybox = if restore_bundled {
+                KeyBox::from_xml_str(&contents)
+            } else {
+                KeyBox::from_complete_xml(&contents)
+            };
+            match keybox {
+                Ok(keybox) => {
+                    let fallback_origin = is_fallback_continuation(&keybox, &contents);
+                    Ok((keybox, fallback_origin))
+                }
+                Err(error) if restore_bundled => {
+                    warn!(
+                        "invalid keybox.xml at {}: {:#}; rewriting bundled template",
+                        path, error
+                    );
+                    write_bundled_keybox(path)?;
+                    Ok((KeyBox::new(), true))
+                }
+                Err(error) => Err(error).with_context(|| format!("failed to load {path}")),
             }
-            Err(error) => {
-                warn!("invalid keybox.xml at {}: {:#}; rewriting bundled template", path, error);
-                write_bundled_keybox(path)?;
-                Ok((KeyBox::new(), true))
-            }
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        }
+        Err(error) if restore_bundled && error.kind() == std::io::ErrorKind::NotFound => {
             info!("keybox.xml missing at {}; writing bundled template", path);
             write_bundled_keybox(path)?;
             Ok((KeyBox::new(), true))
@@ -578,36 +657,89 @@ fn load_keybox_with_fallback(path: &str) -> Result<(KeyBox, bool)> {
     }
 }
 
-pub fn reload_from_disk() -> Result<bool> {
-    reload_from_disk_inner(true)
+fn load_keyboxes(
+    tee_path: &str,
+    strongbox_path: &Path,
+    strongbox: &mut StrongboxKeybox,
+    restore_tee: bool,
+) -> (Result<(KeyBox, bool)>, bool) {
+    let tee = load_tee_keybox(tee_path, restore_tee);
+    let strongbox_refreshed =
+        strongbox.reload(strongbox_path).inspect_err(|error| warn!("{error:#}")).is_ok();
+    (tee, strongbox_refreshed)
 }
 
-fn reload_from_disk_inner(retire_db_entries: bool) -> Result<bool> {
-    let _io_guard = KEYBOX_IO_LOCK.lock().unwrap();
-    let (keybox, used_fallback) = load_keybox_with_fallback(KEYBOX_PATH)?;
-    let changed = install_keybox(keybox, retire_db_entries, !used_fallback);
-    if changed {
-        info!("active keybox identity updated from {} (fallback={})", KEYBOX_PATH, used_fallback);
-    } else {
-        debug!("keybox reload completed without identity change (fallback={})", used_fallback);
+fn reload_keyboxes_locked(restore_tee: bool) -> (Result<bool>, bool) {
+    let tee_identity = KEYBOX.read().unwrap().identity_digest();
+    let (tee, strongbox_refreshed, strongbox_changed) = {
+        let mut strongbox = STRONGBOX_KEYBOX.write().unwrap();
+        let previous = strongbox.dedicated().map_or(tee_identity, KeyBox::identity_digest);
+        let (tee, strongbox_refreshed) = load_keyboxes(
+            KEYBOX_PATH,
+            Path::new(STRONGBOX_KEYBOX_PATH),
+            &mut strongbox,
+            restore_tee,
+        );
+        let tee_identity =
+            tee.as_ref().map_or(tee_identity, |(keybox, _)| keybox.identity_digest());
+        let current = strongbox.dedicated().map_or(tee_identity, KeyBox::identity_digest);
+        (tee, strongbox_refreshed, previous != current)
+    };
+
+    let tee_changed = tee.map(|(keybox, fallback)| {
+        let changed = install_keybox(keybox, !fallback);
+        if changed {
+            info!("active TEE keybox identity updated (fallback={fallback})");
+        }
+        changed
+    });
+    if strongbox_changed {
+        info!("active StrongBox keybox identity updated");
     }
-    Ok(changed)
+    if strongbox_changed || tee_changed.as_ref().is_ok_and(|changed| *changed) {
+        crate::keymaster::keymint_device::clear_initialized_attestation_caches();
+    }
+    (tee_changed, strongbox_refreshed)
+}
+
+fn reload_and_retire_locked(restore_tee: bool) -> Result<bool> {
+    let (tee, strongbox_refreshed) = reload_keyboxes_locked(restore_tee);
+    retire_after_reload(tee.is_ok(), strongbox_refreshed);
+    tee
 }
 
 pub fn initialize() -> Result<()> {
     ensure_keybox_file(KEYBOX_PATH)?;
-    reload_from_disk_inner(false)?;
+    {
+        let _io_guard = KEYBOX_IO_LOCK.write().unwrap();
+        reload_keyboxes_locked(true).0?;
+    }
     KEYBOX_WATCHER.get_or_init(|| {
         if let Err(error) = kmr_common::runtime::file_watch::spawn_path_watcher(
             "omk-keybox-watch",
             PathBuf::from(KEYBOX_PATH),
+            false,
             |_trigger| {
-                if let Err(reload_error) = reload_from_disk() {
+                let _io_guard = KEYBOX_IO_LOCK.write().unwrap();
+                if let Err(reload_error) = reload_and_retire_locked(true) {
                     error!("failed to reload keybox.xml after change: {reload_error:#}");
                 }
             },
         ) {
             error!("failed to watch keybox.xml: {error:#}");
+        }
+        if let Err(error) = kmr_common::runtime::file_watch::spawn_path_watcher(
+            "omk-strongbox-keybox-watch",
+            PathBuf::from(STRONGBOX_KEYBOX_PATH),
+            true,
+            |_trigger| {
+                let _io_guard = KEYBOX_IO_LOCK.write().unwrap();
+                if let Err(error) = reload_and_retire_locked(false) {
+                    warn!("{error:#}");
+                }
+            },
+        ) {
+            error!("failed to watch keybox_strongbox.xml: {error:#}");
         }
     });
     Ok(())
@@ -626,20 +758,37 @@ fn update_keybox_file(
     key_der: Vec<u8>,
     chain: Vec<keymint::Certificate>,
 ) -> Result<bool> {
-    let _io_guard = KEYBOX_IO_LOCK.lock().unwrap();
+    let _io_guard = KEYBOX_IO_LOCK.write().unwrap();
     let mut keybox = KEYBOX.read().unwrap().clone();
     keybox.update_keybox(algorithm, key_der, chain)?;
     write_keybox_xml(KEYBOX_PATH, &keybox.to_xml_string())?;
-    Ok(install_keybox(keybox, true, true))
+    reload_and_retire_locked(false)
 }
 
-pub fn current_identity_digest() -> [u8; 32] {
-    KEYBOX.read().unwrap().identity_digest()
+fn with_active_keybox<T>(
+    security_level: SecurityLevel,
+    f: impl FnOnce(&KeyBox) -> T,
+) -> Result<T, Error> {
+    if security_level == SecurityLevel::STRONGBOX {
+        let strongbox = STRONGBOX_KEYBOX
+            .read()
+            .map_err(|_| kmr_common::km_err!(UnknownError, "failed to lock StrongBox keybox"))?;
+        if let Some(keybox) = strongbox.dedicated() {
+            return Ok(f(keybox));
+        }
+    }
+    let tee =
+        KEYBOX.read().map_err(|_| kmr_common::km_err!(UnknownError, "failed to lock KEYBOX"))?;
+    Ok(f(&tee))
+}
+
+pub fn current_identity_digest(security_level: SecurityLevel) -> [u8; 32] {
+    with_active_keybox(security_level, KeyBox::identity_digest).unwrap()
 }
 
 pub(crate) fn signing_certificate_ders_from_disk() -> Result<Vec<Vec<u8>>> {
-    let _io_guard = KEYBOX_IO_LOCK.lock().unwrap();
-    let (keybox, _) = load_keybox_with_fallback(KEYBOX_PATH)?;
+    let _io_guard = KEYBOX_IO_LOCK.write().unwrap();
+    let (keybox, _) = load_tee_keybox(KEYBOX_PATH, true)?;
     let mut ders = Vec::with_capacity(2);
     if let Some(rsa_info) = &keybox.rsa_info {
         ders.push(rsa_info.chain[0].encoded_certificate.clone());
@@ -648,14 +797,11 @@ pub(crate) fn signing_certificate_ders_from_disk() -> Result<Vec<Vec<u8>>> {
     Ok(ders)
 }
 
-pub struct KeyboxManager;
+pub struct KeyboxManager(pub SecurityLevel);
 
 impl RetrieveCertSigningInfo for KeyboxManager {
     fn signing_info(&self, key_type: SigningKeyType) -> Result<SigningInfoSnapshot, Error> {
-        let keybox = KEYBOX
-            .read()
-            .map_err(|_| kmr_common::km_err!(UnknownError, "failed to lock KEYBOX"))?;
-        keybox.signing_info(key_type)
+        with_active_keybox(self.0, |keybox| keybox.signing_info(key_type))?
     }
 }
 
@@ -792,11 +938,80 @@ mod tests {
     #[test]
     fn invalid_file_falls_back_to_bundled_template() {
         let path = write_temp_keybox("invalid", "<not-xml>");
-        let (keybox, used_fallback) = load_keybox_with_fallback(path.to_str().unwrap()).unwrap();
+        let (keybox, used_fallback) = load_tee_keybox(path.to_str().unwrap(), true).unwrap();
         assert!(used_fallback);
         assert_eq!(keybox.identity_digest(), KeyBox::new().identity_digest());
         let written = fs::read_to_string(path).unwrap();
         assert!(written.contains("<AndroidAttestation>"));
+    }
+
+    #[test]
+    fn strongbox_keybox_keeps_the_last_valid_override_until_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keybox_strongbox.xml");
+        let tee_identity = Some([1; 32]);
+        let mut strongbox = StrongboxKeybox::Missing;
+
+        strongbox.reload(&path).unwrap();
+        assert!(strongbox.dedicated().is_none());
+        assert_eq!(strongbox.retirement_identity(tee_identity), tee_identity);
+
+        fs::write(&path, "<not-xml>").unwrap();
+        assert!(strongbox.reload(&path).is_err());
+        assert!(strongbox.dedicated().is_none());
+        assert_eq!(strongbox.retirement_identity(tee_identity), None);
+
+        fs::write(&path, BUNDLED_KEYBOX_XML).unwrap();
+        strongbox.reload(&path).unwrap();
+        let dedicated_identity = Some(KeyBox::new().identity_digest());
+        assert_eq!(strongbox.retirement_identity(tee_identity), dedicated_identity);
+
+        let (incomplete_xml, _) = BUNDLED_KEYBOX_XML.rsplit_once("</AndroidAttestation>").unwrap();
+        fs::write(&path, incomplete_xml).unwrap();
+        assert!(strongbox.reload(&path).is_err());
+        assert_eq!(strongbox.retirement_identity(tee_identity), dedicated_identity);
+        assert_eq!(fs::read_to_string(&path).unwrap(), incomplete_xml);
+
+        fs::remove_file(&path).unwrap();
+        strongbox.reload(&path).unwrap();
+        assert!(strongbox.dedicated().is_none());
+        assert_eq!(strongbox.retirement_identity(tee_identity), tee_identity);
+    }
+
+    #[test]
+    fn keybox_reload_keeps_strongbox_identity_when_both_files_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let tee_path = dir.path().join("keybox.xml");
+        let strongbox_path = dir.path().join("keybox_strongbox.xml");
+        let tee_path = tee_path.to_str().unwrap();
+        let mut strongbox = StrongboxKeybox::Missing;
+        write_keybox_xml(tee_path, BUNDLED_KEYBOX_XML).unwrap();
+        let (tee, strongbox_refreshed) =
+            load_keyboxes(tee_path, &strongbox_path, &mut strongbox, true);
+        let (mut rotated_tee, _) = tee.unwrap();
+        let original = Some(rotated_tee.identity_digest());
+        assert!(strongbox_refreshed);
+        assert_eq!(strongbox.retirement_identity(original), original);
+
+        write_keybox_xml(strongbox_path.to_str().unwrap(), BUNDLED_KEYBOX_XML).unwrap();
+        rotated_tee.ec_info.chain.push(rotated_tee.ec_info.chain[0].clone());
+        write_keybox_xml(tee_path, &rotated_tee.to_xml_string()).unwrap();
+
+        let (tee, strongbox_refreshed) =
+            load_keyboxes(tee_path, &strongbox_path, &mut strongbox, true);
+        let current_tee = Some(tee.unwrap().0.identity_digest());
+        assert!(strongbox_refreshed);
+        assert_ne!(current_tee, original);
+        assert_eq!(strongbox.retirement_identity(current_tee), original);
+
+        write_keybox_xml(tee_path, BUNDLED_KEYBOX_XML).unwrap();
+        fs::remove_file(&strongbox_path).unwrap();
+        let (tee, strongbox_refreshed) =
+            load_keyboxes(tee_path, &strongbox_path, &mut strongbox, false);
+        let current_tee = Some(tee.unwrap().0.identity_digest());
+        assert!(strongbox_refreshed);
+        assert_eq!(current_tee, original);
+        assert_eq!(strongbox.retirement_identity(current_tee), original);
     }
 
     #[test]
@@ -817,7 +1032,7 @@ mod tests {
         let modified_xml = format!("{BUNDLED_KEYBOX_XML}\n<!-- explicit local keybox -->\n");
         let path = write_temp_keybox("modified", &modified_xml);
 
-        let (_, used_fallback) = load_keybox_with_fallback(path.to_str().unwrap()).unwrap();
+        let (_, used_fallback) = load_tee_keybox(path.to_str().unwrap(), true).unwrap();
 
         assert!(!used_fallback);
     }
