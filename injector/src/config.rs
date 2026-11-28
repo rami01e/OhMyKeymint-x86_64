@@ -466,7 +466,7 @@ fn normalize_scoop_details(
 fn start_watcher(path: PathBuf) {
     let reload_path = path.clone();
     if let Err(error) =
-        file_watch::spawn_path_watcher("injector-config-watch", path, move |trigger| {
+        file_watch::spawn_path_watcher("injector-config-watch", path, false, move |trigger| {
             reload_runtime_config(&reload_path, trigger);
         })
     {

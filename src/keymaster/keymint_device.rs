@@ -15,7 +15,7 @@
 //! Provide the [`KeyMintDevice`] wrapper for operating directly on a KeyMint device.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock};
 
 use crate::android::hardware::security::keymint::ErrorCode::ErrorCode;
 use crate::android::hardware::security::keymint::HardwareAuthToken::HardwareAuthToken;
@@ -164,7 +164,7 @@ fn populate_hal_info_from(
 pub struct KeyMintDevice {
     km_dev: KeyMintWrapper,
     version: i32,
-    km_uuid: RwLock<Uuid>,
+    km_uuid: Uuid,
     security_level: SecurityLevel,
 }
 
@@ -186,7 +186,7 @@ impl KeyMintDevice {
 
     /// Get a [`KeyMintDevice`] for the given [`SecurityLevel`]
     pub fn get(security_level: SecurityLevel) -> Result<KeyMintDevice> {
-        let km_uuid = RwLock::new(Uuid::from(security_level));
+        let km_uuid = Uuid::from(security_level);
         let wrapper: KeyMintWrapper = KeyMintWrapper::new(security_level)?;
         let version = wrapper
             .get_hardware_info()
@@ -207,17 +207,14 @@ impl KeyMintDevice {
     }
 
     pub fn uuid(&self) -> Uuid {
-        *self.km_uuid.read().unwrap()
+        self.km_uuid
     }
 
     pub fn terminate_uuid(&mut self) -> Result<()> {
         DB.with(|db| {
             let mut db = db.borrow_mut();
-            db.terminate_uuid(&self.km_uuid.read().unwrap()).context(err!("terminate_uuid failed"))
-        })?;
-
-        self.km_uuid = RwLock::new(Uuid::from(self.security_level));
-        Ok(())
+            db.terminate_uuid(&self.km_uuid).context(err!("terminate_uuid failed"))
+        })
     }
 
     /// Returns the version of the underlying KeyMint/KeyMaster device.
@@ -252,7 +249,7 @@ impl KeyMintDevice {
         let mut key_metadata = KeyMetaData::new();
         key_metadata.add(KeyMetaEntry::CreationDate(creation_date));
         let mut blob_metadata = BlobMetaData::new();
-        let km_uuid = *self.km_uuid.read().unwrap();
+        let km_uuid = self.km_uuid;
         blob_metadata.add(BlobMetaEntry::KmUuid(km_uuid));
 
         db.store_new_key(
@@ -333,7 +330,7 @@ impl KeyMintDevice {
             // or if there is no blob metadata for some reason the key entry
             // is considered corrupted and needs to be replaced with a new one.
             let key_blob = key_entry.take_key_blob_info().and_then(|(key_blob, blob_metadata)| {
-                if Some(*self.km_uuid.read().unwrap()) == blob_metadata.km_uuid().copied() {
+                if Some(self.km_uuid) == blob_metadata.km_uuid().copied() {
                     Some(key_blob)
                 } else {
                     None
@@ -405,7 +402,7 @@ impl KeyMintDevice {
             f,
             |upgraded_blob| {
                 let mut new_blob_metadata = BlobMetaData::new();
-                new_blob_metadata.add(BlobMetaEntry::KmUuid(*self.km_uuid.read().unwrap()));
+                new_blob_metadata.add(BlobMetaEntry::KmUuid(self.km_uuid));
 
                 db.set_blob(
                     key_id_guard,
@@ -1145,6 +1142,7 @@ fn bootstrap_auth_token_hmac(ta: &mut KeyMintTa, crypto: &CryptoConfig) -> Resul
 }
 
 fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<KeyMintTa> {
+    let sign_info = crate::keybox::KeyboxManager(security_level);
     let security_level = get_keymint_security_level(security_level)?;
     let profile = resolve_hardware_profile(get_keymaster_security_level(security_level)?);
 
@@ -1200,7 +1198,7 @@ fn init_keymint_ta(security_level: SecurityLevel, config: &Config) -> Result<Key
 
     let dev = kmr_ta::device::Implementation {
         keys,
-        sign_info: Some(Box::new(crate::keybox::KeyboxManager {})),
+        sign_info: Some(Box::new(sign_info)),
         // HAL populates attestation IDs from properties.
         attest_ids: Some(Box::new(crate::att_mgr::AttestationIdMgr {})),
         sdd_mgr,
@@ -1446,9 +1444,16 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_ta() -> KeyMintTa {
+        test_ta_with_signer(SecurityLevel::TRUSTED_ENVIRONMENT, None)
+    }
+
+    fn test_ta_with_signer(
+        security_level: SecurityLevel,
+        sign_info: Option<Box<dyn kmr_ta::device::RetrieveCertSigningInfo>>,
+    ) -> KeyMintTa {
         let hw_info = HardwareInfo {
             version_number: KeyMintDevice::KEY_MINT_V5,
-            security_level: kmr_wire::keymint::SecurityLevel::TrustedEnvironment,
+            security_level: get_keymint_security_level(security_level).unwrap(),
             impl_name: "test",
             author_name: "test",
             unique_id: "test",
@@ -1461,7 +1466,7 @@ pub(crate) mod tests {
         };
         let dev = kmr_ta::device::Implementation {
             keys: Box::new(soft::Keys::new([0; 32], [1; 32])),
-            sign_info: None,
+            sign_info,
             attest_ids: None,
             sdd_mgr: None,
             bootloader: Box::new(kmr_ta::device::BootloaderDone),
@@ -1492,19 +1497,19 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn wrapper(ta: KeyMintTa) -> KeyMintWrapper {
+        let hardware_info = ta.get_hardware_info().unwrap();
         KeyMintWrapper {
-            security_level: SecurityLevel::TRUSTED_ENVIRONMENT,
+            security_level: get_keymaster_security_level(hardware_info.security_level).unwrap(),
             inner: Box::leak(Box::new(KeyMintWrapperInner {
                 auth_token_hmac_key: ta.get_hmac_key(),
-                hardware_info: ta.get_hardware_info().unwrap(),
+                hardware_info,
                 keymint: Mutex::new(ta),
             })),
         }
     }
 
-    pub(crate) fn auth_wrapper(key: &[u8; 32]) -> KeyMintWrapper {
-        let mut ta = test_ta();
-        assert_eq!(set_boot_info(&mut ta), 0);
+    fn initialize_test_ta(ta: &mut KeyMintTa) {
+        assert_eq!(set_boot_info(ta), 0);
         assert_eq!(
             ta.process_req(PerformOpReq::SetHalInfo(SetHalInfoRequest {
                 os_version: 170000,
@@ -1514,6 +1519,18 @@ pub(crate) mod tests {
             .error_code,
             0
         );
+    }
+
+    pub(crate) fn attestation_wrapper(security_level: SecurityLevel) -> KeyMintWrapper {
+        let signer = Box::new(crate::keybox::KeyboxManager(security_level));
+        let mut ta = test_ta_with_signer(security_level, Some(signer));
+        initialize_test_ta(&mut ta);
+        wrapper(ta)
+    }
+
+    pub(crate) fn auth_wrapper(key: &[u8; 32]) -> KeyMintWrapper {
+        let mut ta = test_ta();
+        initialize_test_ta(&mut ta);
         ta.set_device_hmac_key(key).unwrap();
         wrapper(ta)
     }

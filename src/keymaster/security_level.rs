@@ -47,6 +47,7 @@ use crate::keymaster::audit_log::{
 use crate::keymaster::db::{
     BlobInfo, BlobMetaData, BlobMetaEntry, CertificateInfo, DateTime, KeyEntry, KeyEntryLoadBits,
     KeyIdGuard, KeyMetaData, KeyMetaEntry, KeyType, SubComponentType, Uuid,
+    KEYBOX_DIGEST_PREFIX_BYTES,
 };
 use crate::keymaster::error::{self, into_logged_binder, map_km_error, Error, ErrorCode};
 use crate::keymaster::id_rotation::IdRotationState;
@@ -227,9 +228,10 @@ impl KeystoreSecurityLevel {
                     let km_uuid = Uuid::from(self.security_level);
                     let mut key_metadata = KeyMetaData::new();
                     key_metadata.add(KeyMetaEntry::CreationDate(creation_date));
-                    if keybox_attested && km_uuid.is_keybox_bound() {
-                        key_metadata.add(KeyMetaEntry::KeyboxAttestationUuidPrefix(
-                            km_uuid.get_digest().to_vec(),
+                    if keybox_attested {
+                        let digest = crate::keybox::current_identity_digest(self.security_level);
+                        key_metadata.add(KeyMetaEntry::KeyboxAttestationDigestPrefix(
+                            digest[..KEYBOX_DIGEST_PREFIX_BYTES].to_vec(),
                         ));
                     }
                     blob_metadata.add(BlobMetaEntry::KmUuid(km_uuid));
@@ -751,6 +753,11 @@ impl KeystoreSecurityLevel {
             .context(ks_err!("Trying to get aaid."))?;
 
         let keybox_attestation_allowed = attestation_key_info.is_none();
+        // Keep the signing keybox active until its identity is recorded with the new key.
+        let _keybox_identity = (keybox_attestation_allowed
+            && key.domain != Domain::BLOB
+            && params.iter().any(|p| p.tag == Tag::ATTESTATION_CHALLENGE))
+        .then(crate::keybox::lock_attestation_identity);
         let creation_result = match attestation_key_info {
             Some(AttestationKeyInfo::UserGenerated {
                 key_id_guard,
@@ -842,6 +849,9 @@ impl KeystoreSecurityLevel {
             })
             .context(ks_err!())?;
 
+        let _keybox_identity = (key.domain != Domain::BLOB
+            && params.iter().any(|p| p.tag == Tag::ATTESTATION_CHALLENGE))
+        .then(crate::keybox::lock_attestation_identity);
         let km_dev = &self.keymint;
         let creation_result = map_km_error({
             let _wp =

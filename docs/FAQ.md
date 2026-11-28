@@ -81,6 +81,7 @@ configuration change, privately back up:
 - `/data/misc/keystore/omk/config.toml`
 - `/data/misc/keystore/omk/injector.toml`
 - `/data/misc/keystore/omk/keybox.xml`
+- `/data/misc/keystore/omk/keybox_strongbox.xml`, if present
 - `/data/misc/keystore/omk/data/`
 
 Treat the backup like a password. It can contain private keys and device
@@ -220,7 +221,11 @@ into key data, invisible characters, or other extra content.
 A file working in another module does not prove that it is valid. Some other
 tools accept damaged or incomplete XML that OMK correctly rejects.
 
-### How should I replace `keybox.xml`?
+### How should I replace a keybox?
+
+TEE uses `/data/misc/keystore/omk/keybox.xml`. To provide a separate keybox for
+StrongBox, use `/data/misc/keystore/omk/keybox_strongbox.xml`. StrongBox follows
+the current TEE keybox whenever the optional file is absent.
 
 Replace the complete active file at
 `/data/misc/keystore/omk/keybox.xml`. Do not open it and save it piece by piece.

@@ -362,6 +362,7 @@ fn start_config_watcher() -> Result<()> {
     file_watch::spawn_path_watcher(
         "omk-config-watch",
         PathBuf::from(CONFIG_PATH),
+        false,
         reload_runtime_config,
     )
 }

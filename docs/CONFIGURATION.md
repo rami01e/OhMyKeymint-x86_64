@@ -165,10 +165,13 @@ keymint.
 
 #### `retire_stale_keybox_bound_keys`
 
-When `true`, changing the active `keybox.xml` deletes client keys that were
-created under the previous keybox identity and attested with that keybox. The
-default is `true`, so a keybox change never leaves keys bound to a stale
-identity.
+When `true` (the default), changing the effective keybox for TEE or StrongBox
+deletes client keys attested under a previous identity for that security level.
+StrongBox has its own identity when `keybox_strongbox.xml` is loaded and
+follows TEE's identity when the optional file is absent.
+
+The first valid keybox scan records the effective identity for each level.
+Retirement starts when a later scan finds a different identity for that level.
 
 Set it to `false` only when replacing or rotating keybox material must keep
 existing keys usable. A keybox that rotates periodically with this disabled
